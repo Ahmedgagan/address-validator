@@ -1,20 +1,18 @@
-# Use a slim version of Node for better performance/smaller size
 FROM node:20-slim
 
-# Create app directory
 WORKDIR /usr/src/app
 
-# Copy package files first (better for caching layers)
+# Copy package files from the current directory (which will be /app)
 COPY package*.json ./
 
-# Install dependencies
 RUN npm install
 
-# Copy the rest of your app code
+# Copy everything else from the current directory
 COPY . .
 
-# Expose the port your app runs on
+# Explicitly check if server.js exists during build (for debugging)
+RUN ls -la
+
 EXPOSE 3000
 
-# Start the application
-CMD [ "npm", "start" ]
+CMD [ "node", "server.js" ]
