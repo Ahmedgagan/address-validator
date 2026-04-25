@@ -1,0 +1,91 @@
+require('dotenv').config();
+const express = require('express');
+const mysql = require('mysql2/promise');
+const axios = require('axios');
+
+const app = express();
+app.use(express.json());
+
+// Database Connection Pool
+const pool = mysql.createPool({
+    host: process.env.DB_HOST,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
+    waitForConnections: true,
+    connectionLimit: 10
+});
+
+// Middleware: Verify License & Domain
+const authorize = async (req, res, next) => {
+    const { license_key, domain } = req.body;
+    
+    if (!license_key || !domain) {
+        return res.status(400).json({ error: 'Missing authentication data' });
+    }
+
+    try {
+        const [rows] = await pool.execute(
+            'SELECT id FROM users WHERE license_key = ? AND origin_domain = ? AND status = "active"',
+            [license_key, domain]
+        );
+
+        if (rows.length === 0) {
+            return res.status(403).json({ error: 'Unauthorized: Invalid license or domain' });
+        }
+
+        req.userId = rows[0].id;
+        next();
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Database authentication error' });
+    }
+};
+
+// Main Validation Endpoint
+app.post('/v1/validate', authorize, async (req, res) => {
+    const { type, zip, place_id } = req.body;
+
+    try {
+        let result = {};
+
+        // Feature 1: ZIP Auto-Detection
+        if (type === 'zip_only') {
+            const response = await axios.get(`https://api.zippopotam.us/us/${zip}`);
+            const data = response.data.places[0];
+            result = {
+                city: data['place name'],
+                state: data['state'],
+                country: 'US'
+            };
+        }
+
+        // Feature 2 & 3: Autocomplete Match-Check
+        if (type === 'full_verify' && place_id) {
+            const googleUrl = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${place_id}&fields=address_component&key=${process.env.GOOGLE_PLACES_API_KEY}`;
+            const response = await axios.get(googleUrl);
+            const components = response.data.result.address_components;
+            
+            const googleZip = components.find(c => c.types.includes('postal_code'))?.short_name;
+
+            result = {
+                mismatch: googleZip !== zip,
+                confirmed_zip: googleZip
+            };
+        }
+
+        // Log Usage
+        await pool.execute(
+            'INSERT INTO usage_logs (license_id, request_type) VALUES (?, ?)',
+            [req.userId, type]
+        );
+
+        res.json(result);
+
+    } catch (error) {
+        res.status(500).json({ error: 'Validation failed', details: error.message });
+    }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`SaaS Validator running on port ${PORT}`));
