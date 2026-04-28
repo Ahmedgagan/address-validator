@@ -65,20 +65,37 @@ app.get('/v1/autocomplete', authorize, async (req, res) => {
     const { input, session_token } = req.query;
 
     try {
-        const googleUrl = `https://googleapis.com`;
-        const response = await axios.get(googleUrl, {
-            params: {
-                input,
-                sessiontoken: session_token,
-                key: process.env.GOOGLE_PLACES_API_KEY,
-                components: 'country:in', // Restricted to India
-                types: 'address'
+        // 1. New Google Endpoint
+        const googleUrl = `https://places.googleapis.com/v1/places:autocomplete`;
+
+        // 2. Prepare the request body for the New API
+        const requestBody = {
+            input: input,
+            sessionToken: session_token,
+            includedRegionCodes: ['in'], // Restricted to India
+            // Optional: You can add locationBias here if you want to prioritize a specific city like Dubai or Mumbai
+        };
+
+        // 3. Make the POST request to Google
+        const response = await axios.post(googleUrl, requestBody, {
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Goog-Api-Key': process.env.GOOGLE_PLACES_API_KEY
             }
         });
 
-        res.json(response.data.predictions);
+        // The New API returns "suggestions" instead of "predictions"
+        res.json(response.data.suggestions || []);
+
     } catch (error) {
-        res.status(500).json({ error: 'Autocomplete failed' });
+        // Logs the exact reason for failure in your terminal
+        const errorData = error.response ? error.response.data : error.message;
+        console.error('Google Places New API Error:', errorData);
+
+        res.status(500).json({
+            error: 'Autocomplete failed',
+            details: errorData
+        });
     }
 });
 
@@ -87,61 +104,40 @@ app.get('/v1/autocomplete', authorize, async (req, res) => {
  * Gets full address details to fill WooCommerce fields and verify ZIP.
  */
 app.post('/v1/validate', authorize, async (req, res) => {
-    const { type, zip, place_id, session_token } = req.body;
+    const { type, place_id, session_token } = req.body;
 
-    try {
-        let result = {};
+    if (type === 'full_verify' && place_id) {
+        try {
+            // New v1 Places Details Endpoint
+            const googleUrl = `https://places.googleapis.com/v1/places/${place_id}`;
 
-        // Zip only logic (remains as fallback)
-        if (type === 'zip_only') {
-            const response = await axios.get(`https://zippopotam.us{zip}`); // Changed to 'in' for India
-            const data = response.data.places[0];
-            result = {
-                city: data['place name'],
-                state: data['state'],
-                country: 'IN'
-            };
-        }
-
-        // Full Autocomplete Verify & Autofill Data
-        if (type === 'full_verify' && place_id) {
-            const googleUrl = `https://maps.googleapis.com/maps/api/place/details/json`;
             const response = await axios.get(googleUrl, {
+                headers: {
+                    'X-Goog-Api-Key': process.env.GOOGLE_PLACES_API_KEY,
+                    'X-Goog-FieldMask': 'addressComponents,formattedAddress,postalCode'
+                },
                 params: {
-                    place_id,
-                    sessiontoken: session_token, // Closes the session for billing
-                    fields: 'address_components',
-                    key: process.env.GOOGLE_PLACES_API_KEY
+                    sessionToken: session_token
                 }
             });
 
-            const components = response.data.result.address_components;
+            const components = response.data.addressComponents;
             
-            const getComp = (t) => components.find(c => c.types.includes(t))?.long_name || '';
-            const googleZip = components.find(c => c.types.includes('postal_code'))?.short_name || '';
+            // Helper function to extract specific parts
+            const getComp = (type) => components.find(c => c.types.includes(type))?.longText || '';
 
-            result = {
-                mismatch: zip ? (googleZip !== zip) : false,
-                confirmed_zip: googleZip,
-                autofill: {
-                    address_1: `${getComp('house_number')} ${getComp('street_number')} ${getComp('route')}`.trim(),
-                    city: getComp('locality') || getComp('postal_town'),
-                    state: getComp('administrative_area_level_1'),
-                    country: 'IN'
-                }
-            };
+            res.json({
+                address_1: `${getComp('street_number')} ${getComp('route')}`.trim(),
+                city: getComp('locality'),
+                state: getComp('administrative_area_level_1'),
+                postcode: response.data.postalCode || getComp('postal_code'),
+                country: 'IN'
+            });
+
+        } catch (error) {
+            console.error('Details Error:', error.response?.data || error.message);
+            res.status(500).json({ error: 'Failed to fetch address details' });
         }
-
-        // Log Usage for your $5/month billing limit
-        await pool.execute(
-            'INSERT INTO usage_logs (license_id, request_type) VALUES (?, ?)',
-            [req.userId, type]
-        );
-
-        res.json(result);
-
-    } catch (error) {
-        res.status(500).json({ error: 'Validation failed', details: error.message });
     }
 });
 
