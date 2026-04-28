@@ -127,12 +127,29 @@ app.post('/v1/validate', authorize, async (req, res) => {
         const components = response.data.addressComponents || [];
         const getComp = (type) => components.find(c => c.types.includes(type))?.longText || '';
 
-        // Standardized mapping
+        // 1. Get the specific pieces
+        const streetNumber = getComp('street_number'); // e.g., "102"
+        const buildingName = getComp('premise') || getComp('point_of_interest'); // e.g., "Rivera Heights"
+        const route = getComp('route'); // e.g., "Main Road"
+        const sublocality = getComp('sublocality_level_1'); // e.g., "Adajan"
+
+        // 2. Build a "Full" Street Address
+        // Logic: (Building Name or Street Number) + Route. If all empty, use Sublocality.
+        let addressLine1 = '';
+
+        if (buildingName || streetNumber || route) {
+            addressLine1 = `${buildingName} ${streetNumber} ${route}`.trim();
+        } else {
+            // If Google doesn't give us specific street info, 
+            // we take the first segment of the formatted address (usually the house/shop name)
+            addressLine1 = response.data.formattedAddress?.split(',')[0] || sublocality;
+        }
+
         res.json({
-            address_1: getComp('street_number') ? `${getComp('street_number')} ${getComp('route')}`.trim() : getComp('sublocality_level_1') || getComp('route'),
+            address_1: addressLine1,
             city: getComp('locality'),
             state: getComp('administrative_area_level_1'),
-            postcode: getComp('postal_code'),
+            postcode: getComp('postal_code') || response.data.postalCode || '',
             country: 'IN'
         });
 
