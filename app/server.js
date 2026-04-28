@@ -104,40 +104,46 @@ app.get('/v1/autocomplete', authorize, async (req, res) => {
  * Gets full address details to fill WooCommerce fields and verify ZIP.
  */
 app.post('/v1/validate', authorize, async (req, res) => {
-    const { type, place_id, session_token } = req.body;
+    const { place_id, session_token } = req.body;
 
-    if (type === 'full_verify' && place_id) {
-        try {
-            // New v1 Places Details Endpoint
-            const googleUrl = `https://places.googleapis.com/v1/places/${place_id}`;
+    if (!place_id) return res.status(400).json({ error: 'place_id is required' });
 
-            const response = await axios.get(googleUrl, {
-                headers: {
-                    'X-Goog-Api-Key': process.env.GOOGLE_PLACES_API_KEY,
-                    'X-Goog-FieldMask': 'addressComponents,formattedAddress,postalCode'
-                },
-                params: {
-                    sessionToken: session_token
-                }
-            });
+    try {
+        // The V1 New API URL
+        const googleUrl = `https://places.googleapis.com/v1/places/${place_id}`;
 
-            const components = response.data.addressComponents;
-            
-            // Helper function to extract specific parts
-            const getComp = (type) => components.find(c => c.types.includes(type))?.longText || '';
+        const response = await axios.get(googleUrl, {
+            headers: {
+                'X-Goog-Api-Key': process.env.GOOGLE_PLACES_API_KEY,
+                // Using the most standard FieldMask
+                'X-Goog-FieldMask': 'addressComponents,formattedAddress'
+            },
+            params: {
+                // Google New API expects camelCase sessionToken in params
+                'sessionToken': session_token 
+            }
+        });
 
-            res.json({
-                address_1: `${getComp('street_number')} ${getComp('route')}`.trim(),
-                city: getComp('locality'),
-                state: getComp('administrative_area_level_1'),
-                postcode: response.data.postalCode || getComp('postal_code'),
-                country: 'IN'
-            });
+        const components = response.data.addressComponents || [];
+        const getComp = (type) => components.find(c => c.types.includes(type))?.longText || '';
 
-        } catch (error) {
-            console.error('Details Error:', error.response?.data || error.message);
-            res.status(500).json({ error: 'Failed to fetch address details' });
-        }
+        // Standardized mapping
+        res.json({
+            address_1: getComp('street_number') ? `${getComp('street_number')} ${getComp('route')}`.trim() : getComp('sublocality_level_1') || getComp('route'),
+            city: getComp('locality'),
+            state: getComp('administrative_area_level_1'),
+            postcode: getComp('postal_code'),
+            country: 'IN'
+        });
+
+    } catch (error) {
+        // This will now print the FULL error detail from Google so we can see which argument is "invalid"
+        console.error('Google API Error Response:', JSON.stringify(error.response?.data, null, 2));
+        
+        res.status(500).json({ 
+            error: 'Failed to fetch address details',
+            debug: error.response?.data?.error?.message || error.message
+        });
     }
 });
 
