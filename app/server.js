@@ -4,165 +4,283 @@ const mysql = require('mysql2/promise');
 const axios = require('axios');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
+const Redis = require('ioredis');
 
 const app = express();
 app.use(express.json());
-app.use(cors()); // Required for WooCommerce frontend to communicate with your API
+app.use(cors());
 
-// Database Connection Pool
+/* =========================
+   REDIS
+========================= */
+const redis = new Redis(process.env.REDIS_URL);
+
+/* =========================
+   MYSQL
+========================= */
 const pool = mysql.createPool({
     host: process.env.DB_HOST,
     user: process.env.DB_USER,
     password: process.env.DB_PASSWORD,
     database: process.env.DB_NAME,
     waitForConnections: true,
-    connectionLimit: 10,
-    enableKeepAlive: true
+    connectionLimit: 25
 });
 
-// Middleware: Verify License, Domain, and Usage Limits
+/* =========================
+   AUTHORIZE
+========================= */
 const authorize = async (req, res, next) => {
-    // In GET requests (autocomplete), params come from query. In POST, from body.
     const license_key = req.body.license_key || req.query.license_key;
     const domain = req.body.domain || req.query.domain;
-    
+
     if (!license_key || !domain) {
         return res.status(400).json({ error: 'Missing license or domain' });
     }
 
-    try {
-        const [rows] = await pool.execute(
-            'SELECT id FROM users WHERE license_key = ? AND origin_domain = ? AND status = "active"',
-            [license_key, domain]
-        );
+    const [rows] = await pool.execute(
+        'SELECT id, monthly_limit FROM users WHERE license_key = ? AND origin_domain = ? AND status = "active"',
+        [license_key, domain]
+    );
 
-        if (rows.length === 0) {
-            return res.status(403).json({ error: 'Unauthorized license' });
-        }
-
-        // Optional: Add a check here to see if usage_logs count for this user > 1000
-        req.userId = rows[0].id;
-        next();
-    } catch (err) {
-        res.status(500).json({ error: 'Auth error' });
+    if (!rows.length) {
+        return res.status(403).json({ error: 'Unauthorized' });
     }
+
+    req.userId = rows[0].id;
+    req.monthlyLimit = rows[0].monthly_limit;
+
+    next();
 };
 
-/**
- * FEATURE 1: START SESSION
- * Generates a UUID for Google Session-based billing.
- * Frontend should call this when the checkout page loads.
- */
-app.get('/v1/start-session', authorize, (req, res) => {
-    res.json({ session_token: uuidv4() });
+/* =========================
+   SESSION CHECK
+========================= */
+const checkSession = async (req, res, next) => {
+    const token = req.query.session_token || req.body.session_token;
+
+    if (!token) {
+        return res.status(400).json({ error: 'Missing session token' });
+    }
+
+    const raw = await redis.get(`session:${token}`);
+    if (!raw) {
+        return res.status(403).json({ error: 'Invalid/expired session' });
+    }
+
+    const session = JSON.parse(raw);
+
+    if (Date.now() > session.expiresAt) {
+        return res.status(403).json({ error: 'Session expired' });
+    }
+
+    req.session = session;
+    req.sessionToken = token;
+
+    next();
+};
+
+/* =========================
+   USAGE TRACKING
+========================= */
+const getMonthKey = () => new Date().toISOString().slice(0, 7);
+
+const incrementUsage = async (licenseId, type) => {
+    const month = getMonthKey();
+
+    const field =
+        type === 'autocomplete'
+            ? 'autocomplete_count'
+            : 'validate_count';
+
+    await pool.execute(
+        `
+        INSERT INTO usage_counters (license_id, month_key, ${field})
+        VALUES (?, ?, 1)
+        ON DUPLICATE KEY UPDATE ${field} = ${field} + 1
+        `,
+        [licenseId, month]
+    );
+};
+
+const getUsage = async (licenseId) => {
+    const month = getMonthKey();
+
+    const [rows] = await pool.execute(
+        `
+        SELECT autocomplete_count, validate_count
+        FROM usage_counters
+        WHERE license_id = ? AND month_key = ?
+        `,
+        [licenseId, month]
+    );
+
+    return rows[0] || { autocomplete_count: 0, validate_count: 0 };
+};
+
+/* =========================
+   START SESSION
+========================= */
+app.get('/v1/start-session', authorize, async (req, res) => {
+    const token = uuidv4();
+    const now = Date.now();
+
+    const session = {
+        userId: req.userId,
+        createdAt: now,
+        expiresAt: now + 15 * 60 * 1000,
+        autocompleteCount: 0,
+        validateCount: 0
+    };
+
+    await redis.set(
+        `session:${token}`,
+        JSON.stringify(session),
+        'EX',
+        900
+    );
+
+    res.json({ session_token: token });
 });
 
-/**
- * FEATURE 2: AUTOCOMPLETE SUGGESTIONS
- * Provides the "Type-ahead" list as the user types.
- */
-app.get('/v1/autocomplete', authorize, async (req, res) => {
-    const { input, session_token } = req.query;
-
+/* =========================
+   AUTOCOMPLETE
+========================= */
+app.get('/v1/autocomplete', authorize, checkSession, async (req, res) => {
     try {
-        // 1. New Google Endpoint
-        const googleUrl = `https://places.googleapis.com/v1/places:autocomplete`;
+        let { input, session_token } = req.query;
 
-        // 2. Prepare the request body for the New API
-        const requestBody = {
-            input: input,
-            sessionToken: session_token,
-            includedRegionCodes: ['in'], // Restricted to India
-            // Optional: You can add locationBias here if you want to prioritize a specific city like Dubai or Mumbai
-        };
+        if (!input || input.trim().length < 3) {
+            return res.json([]);
+        }
 
-        // 3. Make the POST request to Google
-        const response = await axios.post(googleUrl, requestBody, {
-            headers: {
-                'Content-Type': 'application/json',
-                'X-Goog-Api-Key': process.env.GOOGLE_PLACES_API_KEY
+        const normalized = input.trim().toLowerCase();
+
+        // SESSION LIMIT
+        if (req.session.autocompleteCount >= 20) {
+            return res.status(429).json({ error: 'Session limit reached' });
+        }
+
+        // MONTHLY LIMIT
+        const usage = await getUsage(req.userId);
+        if (usage.autocomplete_count >= req.monthlyLimit) {
+            return res.status(429).json({ error: 'Monthly limit exceeded' });
+        }
+
+        // CACHE
+        const cacheKey = `ac:${normalized}`;
+        const cached = await redis.get(cacheKey);
+        if (cached) {
+            return res.json(JSON.parse(cached));
+        }
+
+        // GOOGLE CALL
+        const response = await axios.post(
+            'https://places.googleapis.com/v1/places:autocomplete',
+            {
+                input: normalized,
+                sessionToken: session_token,
+                includedRegionCodes: ['in']
+            },
+            {
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Goog-Api-Key': process.env.GOOGLE_PLACES_API_KEY
+                }
             }
-        });
+        );
 
-        // The New API returns "suggestions" instead of "predictions"
-        res.json(response.data.suggestions || []);
+        const suggestions = response.data.suggestions || [];
 
-    } catch (error) {
-        // Logs the exact reason for failure in your terminal
-        const errorData = error.response ? error.response.data : error.message;
-        console.error('Google Places New API Error:', errorData);
+        // UPDATE SESSION
+        req.session.autocompleteCount++;
+        await redis.set(
+            `session:${req.sessionToken}`,
+            JSON.stringify(req.session),
+            'KEEPTTL'
+        );
 
-        res.status(500).json({
-            error: 'Autocomplete failed',
-            details: errorData
-        });
+        // UPDATE USAGE
+        await incrementUsage(req.userId, 'autocomplete');
+
+        // CACHE STORE
+        await redis.set(cacheKey, JSON.stringify(suggestions), 'EX', 300);
+
+        res.json(suggestions);
+
+    } catch (err) {
+        res.status(500).json({ error: 'Autocomplete failed' });
     }
 });
 
-/**
- * FEATURE 3: VALIDATE & AUTOFILL
- * Gets full address details to fill WooCommerce fields and verify ZIP.
- */
-app.post('/v1/validate', authorize, async (req, res) => {
-    const { place_id, session_token } = req.body;
-
-    if (!place_id) return res.status(400).json({ error: 'place_id is required' });
-
+/* =========================
+   VALIDATE
+========================= */
+app.post('/v1/validate', authorize, checkSession, async (req, res) => {
     try {
-        // The V1 New API URL
-        const googleUrl = `https://places.googleapis.com/v1/places/${place_id}`;
+        const { place_id, session_token } = req.body;
 
-        const response = await axios.get(googleUrl, {
-            headers: {
-                'X-Goog-Api-Key': process.env.GOOGLE_PLACES_API_KEY,
-                // Using the most standard FieldMask
-                'X-Goog-FieldMask': 'addressComponents,formattedAddress'
-            },
-            params: {
-                // Google New API expects camelCase sessionToken in params
-                'sessionToken': session_token 
-            }
-        });
-
-        const components = response.data.addressComponents || [];
-        const getComp = (type) => components.find(c => c.types.includes(type))?.longText || '';
-
-        // 1. Get the specific pieces
-        const streetNumber = getComp('street_number'); // e.g., "102"
-        const buildingName = getComp('premise') || getComp('point_of_interest'); // e.g., "Rivera Heights"
-        const route = getComp('route'); // e.g., "Main Road"
-        const sublocality = getComp('sublocality_level_1'); // e.g., "Adajan"
-
-        // 2. Build a "Full" Street Address
-        // Logic: (Building Name or Street Number) + Route. If all empty, use Sublocality.
-        let addressLine1 = '';
-
-        if (buildingName || streetNumber || route) {
-            addressLine1 = `${buildingName} ${streetNumber} ${route}`.trim();
-        } else {
-            // If Google doesn't give us specific street info, 
-            // we take the first segment of the formatted address (usually the house/shop name)
-            addressLine1 = response.data.formattedAddress?.split(',')[0] || sublocality;
+        if (!place_id) {
+            return res.status(400).json({ error: 'place_id required' });
         }
 
+        if (req.session.validateCount >= 2) {
+            return res.status(429).json({ error: 'Session validate limit' });
+        }
+
+        const usage = await getUsage(req.userId);
+        if (usage.validate_count >= req.monthlyLimit) {
+            return res.status(429).json({ error: 'Monthly limit exceeded' });
+        }
+
+        const response = await axios.get(
+            `https://places.googleapis.com/v1/places/${place_id}`,
+            {
+                headers: {
+                    'X-Goog-Api-Key': process.env.GOOGLE_PLACES_API_KEY,
+                    'X-Goog-FieldMask':
+                        'addressComponents,formattedAddress'
+                },
+                params: { sessionToken: session_token }
+            }
+        );
+
+        const components = response.data.addressComponents || [];
+        const getComp = (t) =>
+            components.find(c => c.types.includes(t))?.longText || '';
+
+        const street = getComp('street_number');
+        const building =
+            getComp('premise') || getComp('point_of_interest');
+        const route = getComp('route');
+
+        const address_1 =
+            `${building} ${street} ${route}`.trim() ||
+            response.data.formattedAddress?.split(',')[0];
+
+        // UPDATE SESSION
+        req.session.validateCount++;
+        await redis.set(
+            `session:${req.sessionToken}`,
+            JSON.stringify(req.session),
+            'KEEPTTL'
+        );
+
+        // UPDATE USAGE
+        await incrementUsage(req.userId, 'validate');
+
         res.json({
-            address_1: addressLine1,
+            address_1,
             city: getComp('locality'),
             state: getComp('administrative_area_level_1'),
-            postcode: getComp('postal_code') || response.data.postalCode || '',
+            postcode: getComp('postal_code') || '',
             country: 'IN'
         });
 
-    } catch (error) {
-        // This will now print the FULL error detail from Google so we can see which argument is "invalid"
-        console.error('Google API Error Response:', JSON.stringify(error.response?.data, null, 2));
-        
-        res.status(500).json({ 
-            error: 'Failed to fetch address details',
-            debug: error.response?.data?.error?.message || error.message
-        });
+    } catch (err) {
+        res.status(500).json({ error: 'Validation failed' });
     }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`SaaS Validator running on port ${PORT}`));
+/* ========================= */
+app.listen(process.env.PORT || 3000);
