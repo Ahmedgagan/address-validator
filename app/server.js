@@ -256,7 +256,7 @@ app.post('/v1/validate', authorize, checkSession, async (req, res) => {
 
         const address_1 =
             `${building} ${street} ${route}`.trim() ||
-            response.data.formattedAddress?.split(',')[0];
+            response.data.formattedAddress;
 
         // UPDATE SESSION
         req.session.validateCount++;
