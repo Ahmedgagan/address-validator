@@ -1,3 +1,5 @@
+version: "3.9"
+
 services:
   app:
     build:
@@ -7,11 +9,15 @@ services:
     restart: always
     ports:
       - "3000:3000"
-    # This pulls variables from your .env file in the root
     env_file: .env
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_started
+    # If you prefer to keep REDIS_URL in .env, omit this block
+    environment:
+      - REDIS_URL=redis://redis:6379
 
   db:
     image: mysql:8.0
@@ -30,6 +36,14 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: validator_redis
+    restart: always
+    ports:
+      - "6379:6379" # optional; remove if you don’t need host access
+    command: ["redis-server", "--save", "", "--appendonly", "no"] # simple, no persistence
 
 volumes:
   db_data:
